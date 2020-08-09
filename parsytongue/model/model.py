@@ -14,8 +14,8 @@ from typing import Dict, Optional, Tuple, Any, List
 
 from parsytongue.model.bilinear_matrix_attention import BilinearMatrixAttention
 from parsytongue.model.chu_liu_edmonds import decode_mst
-from parsytongue.model.embedder import Embedder, CachableUncontextualizedEmbedderStack, EmbedderConfig
-from parsytongue.model.encoder import Encoder, LstmEncoder, EncoderConfig
+from parsytongue.model.embedder import Embedder, CachableUncontextualizedEmbedderStack, EmbedderStack, EmbedderConfig, DeviceGetterMixin
+from parsytongue.model.encoder import Encoder, LstmEncoder, PassThroughEncoder, EncoderConfig
 from parsytongue.model.perf_counter import timed
 from parsytongue.model.vectorizers import VectorizerStack, VectorizerConfig
 
@@ -43,7 +43,7 @@ class ModelConfig(object):
     weights_path = attr.ib()
 
 
-class Model(nn.Module):
+class Model(nn.Module, DeviceGetterMixin):
     def __init__(
         self,
         embedder: Embedder,
@@ -259,7 +259,7 @@ class Model(nn.Module):
     @classmethod
     def from_config(cls, vocab, config):
         vectorizer = VectorizerStack.from_config(vocab, config.vectorizers)
-        embedder = CachableUncontextualizedEmbedderStack.from_config(vectorizer, config.embedders)
-        encoder = LstmEncoder(embedder.get_output_size(), config.encoder.params)
+        embedder = EmbedderStack.from_config(config.embedders)
+        encoder = PassThroughEncoder(embedder.get_output_size(), config.encoder.params)
 
-        return cls(embedder, encoder, config.decoder)
+        return vectorizer, cls(embedder, encoder, config.decoder)

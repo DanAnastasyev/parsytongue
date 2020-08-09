@@ -72,6 +72,7 @@ _PARAMS_MAPPING = {
     'text_field_embedder.token_embedder_elmo._elmo.char': '_embedder._embedders.0.char',
     'text_field_embedder.token_embedder_elmo._elmo._highways': '_embedder._embedders.0._highways',
     'text_field_embedder.token_embedder_elmo._elmo._projection': '_embedder._embedders.0._projection',
+    'text_field_embedder.token_embedder_ru_bert._matched_embedder.transformer_model': '_embedder._embedders.0._bert',
 }
 
 
@@ -94,7 +95,7 @@ class Parser(object):
         self._vocab = Vocabulary.from_files(config.vocab.vocab_path)
         self._lemmatize_helper = LemmatizeHelper.load(config.vocab.lemmatizer_path)
 
-        self._model = Model.from_config(self._vocab, config.model)
+        self._vectorizer, self._model = Model.from_config(self._vocab, config.model)
         logger.info('Loaded model:\n%s', self._model)
 
         self._model.load_state_dict(_load_weights(config.model.weights_path))
@@ -107,39 +108,18 @@ class Parser(object):
         self,
         sentence: List[str],
         predict_morphology: bool = True,
-        predict_lemmas: bool = True,
+        predict_lemmas: bool = False,
         predict_syntax: bool = True,
     ):
         with timed('Run model'):
             with torch.no_grad():
-                predictions = self._model(sentence, predict_morphology, predict_lemmas, predict_syntax)
+                inputs = self._vectorizer(sentence)
+                bert_inputs = inputs['bert']
+                bert_inputs = {key: val.unsqueeze(0).to(self._model.device) for key, val in bert_inputs.items()}
+                predictions = self._model(bert_inputs, predict_morphology, predict_lemmas, predict_syntax)
 
         with timed('Decode predictions'):
             return self._decode(sentence, predictions)
-
-    # # TODO: should be model-specific vectorizers
-    # def _encode(self, sentence: List[str]) -> Dict[str, torch.Tensor]:
-    #     seq_len = len(sentence)
-    #     max_word_len = max(len(token) for token in sentence)
-
-    #     chars = np.zeros((1, seq_len, max_word_len), dtype=np.int64)
-    #     for token_index, token in enumerate(sentence):
-    #         chars[0, token_index, :len(token)] = [
-    #             self._vocab.get_token_index(symbol, 'token_characters') for symbol in token
-    #         ]
-
-    #     chars = torch.from_numpy(chars)
-
-    #     morpho_embeddings = [[self._morpho_vectorizer(token) for token in sentence]]
-    #     morpho_embeddings = torch.tensor(morpho_embeddings, dtype=torch.float32)
-
-    #     mask = torch.ones((1, seq_len), dtype=torch.bool)
-
-    #     return {
-    #         'chars': chars,
-    #         'morpho_embeddings': morpho_embeddings,
-    #         'mask': mask
-    #     }
 
     def _decode(self, sentence: List[str], predictions: Dict[str, torch.Tensor]):
         outputs = {}

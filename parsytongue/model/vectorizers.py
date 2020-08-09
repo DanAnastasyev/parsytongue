@@ -18,6 +18,7 @@ _MAX_WORD_LEN = 50
 class VectorizerConfig(object):
     name = attr.ib()
     vector_key = attr.ib()
+    params = attr.ib(default=None)
 
 
 class Vectorizer(object):
@@ -69,6 +70,37 @@ class ELMoVectorizer(Vectorizer):
         char_ids = char_ids + 1
 
         return torch.from_numpy(char_ids)
+
+
+class BertVectorizer(Vectorizer):
+    NAME = 'bert'
+
+    def __init__(self, tokenizer_path, **kwargs):
+        from transformers import BertTokenizer
+
+        self._tokenizer = BertTokenizer.from_pretrained(tokenizer_path, do_lower_case=False)
+
+    def __call__(self, tokens):
+        offsets, token_ids = [], []
+        token_ids.append(self._tokenizer.cls_token_id)
+        for token in tokens:
+            subtoken_ids = self._tokenizer.convert_tokens_to_ids(self._tokenizer.tokenize(token))
+            offsets.append([len(token_ids), len(token_ids) + len(subtoken_ids) - 1])
+            token_ids.extend(subtoken_ids)
+
+        token_ids.append(self._tokenizer.sep_token_id)
+
+        token_ids = torch.tensor(token_ids, dtype=torch.long)
+        offsets = torch.tensor(offsets, dtype=torch.long)
+        mask = torch.ones_like(token_ids)
+        segment_ids = torch.zeros_like(token_ids)
+
+        return {
+            'token_ids': token_ids,
+            'mask': mask,
+            'segment_ids': segment_ids,
+            'offsets': offsets
+        }
 
 
 class MorphoVectorizer(Vectorizer):
@@ -133,7 +165,7 @@ class MorphoVectorizer(Vectorizer):
 
 
 class VectorizerStack(Vectorizer):
-    _REGISTERED_VECTORIZERS = [CharacterLevelVectorizer, MorphoVectorizer, ELMoVectorizer]
+    _REGISTERED_VECTORIZERS = [CharacterLevelVectorizer, MorphoVectorizer, ELMoVectorizer, BertVectorizer]
 
     def __init__(self, vectorizers: Dict[str, Vectorizer]):
         self._vectorizers = vectorizers
@@ -150,7 +182,8 @@ class VectorizerStack(Vectorizer):
         for config in configs:
             for vectorizer_cls in cls._REGISTERED_VECTORIZERS:
                 if config.name == vectorizer_cls.NAME:
-                    vectorizers[config.vector_key] = vectorizer_cls(vocab=vocab)
+                    params = config.params or {}
+                    vectorizers[config.vector_key] = vectorizer_cls(vocab=vocab, **params)
 
         assert len(vectorizers) == len(configs)
 

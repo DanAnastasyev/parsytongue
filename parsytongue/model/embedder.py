@@ -168,8 +168,58 @@ class PassThroughEmbedder(nn.Module, Embedder, DeviceGetterMixin):
         return inputs
 
 
+class BertEmbedder(nn.Module, Embedder, DeviceGetterMixin):
+    NAME = 'bert'
+
+    def __init__(self, config: Dict):
+        from transformers import BertModel, BertConfig
+
+        super(BertEmbedder, self).__init__()
+
+        self._config = BertConfig(**config)
+        self._bert = BertModel(self._config)
+
+    def get_output_size(self):
+        return self._config.hidden_size
+
+    def forward(self, inputs):
+        from allennlp.nn.util import batched_span_select
+
+        # TODO: Process long inputs
+        embeddings, _ = self._bert(
+            input_ids=inputs['token_ids'],
+            attention_mask=inputs['mask'],
+            token_type_ids=inputs['segment_ids'],
+        )
+
+        # span_embeddings: (batch_size, num_orig_tokens, max_span_length, embedding_size)
+        # span_mask: (batch_size, num_orig_tokens, max_span_length)
+        span_embeddings, span_mask = batched_span_select(embeddings.contiguous(), inputs['offsets'])
+        span_mask = span_mask.unsqueeze(-1)
+        span_embeddings *= span_mask  # zero out paddings
+
+        span_embeddings_sum = span_embeddings.sum(2)
+        span_embeddings_len = span_mask.sum(2)
+        # Shape: (batch_size, num_orig_tokens, embedding_size)
+        orig_embeddings = span_embeddings_sum / span_embeddings_len
+
+        # All the places where the span length is zero, write in zeros.
+        orig_embeddings = torch.where(
+            (span_embeddings_len == 0).expand_as(orig_embeddings),
+            torch.zeros_like(orig_embeddings),
+            orig_embeddings
+        )
+
+        return orig_embeddings
+
+
 class EmbedderStack(nn.Module, Embedder, DeviceGetterMixin):
-    _REGISTERED_EMBEDDERS = [CharacterLevelEmbedder, PassThroughEmbedder, UncontextualizedELMoEmbedder]
+    _REGISTERED_EMBEDDERS = [
+        CharacterLevelEmbedder,
+        PassThroughEmbedder,
+        UncontextualizedELMoEmbedder,
+        BertEmbedder
+    ]
 
     def __init__(self, embedders) -> None:
         super(EmbedderStack, self).__init__()
@@ -180,7 +230,12 @@ class EmbedderStack(nn.Module, Embedder, DeviceGetterMixin):
         return sum(embedder.get_output_size() for embedder in self._embedders)
 
     def forward(self, inputs):
-        return torch.cat([embedder(inputs) for embedder in self._embedders], -1)
+        token_embeddings = torch.cat([embedder(inputs) for embedder in self._embedders], -1)
+
+        return {
+            'token_embeddings': token_embeddings,
+            'mask': torch.ones(token_embeddings.shape[:-1]).to(self.device)
+        }
 
     @classmethod
     def from_config(cls, configs: List[EmbedderConfig]):
@@ -234,10 +289,6 @@ class CachableUncontextualizedEmbedderStack(nn.Module, Embedder, DeviceGetterMix
 
             for unknown_token, unknown_token_embedding in zip(unknown_tokens, unknown_token_embeddings[0]):
                 self._embeddings_cache[unknown_token] = unknown_token_embedding
-
-        # vectorized_inputs = self._vectorizer(inputs)
-        # vectorized_inputs = {key: val.unsqueeze(0) for key, val in vectorized_inputs.items()}
-        # token_embeddings = torch.cat([embedder(vectorized_inputs) for embedder in self._embedders], dim=-1)
 
         return {
             'token_embeddings': token_embeddings,
