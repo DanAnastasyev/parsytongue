@@ -37,8 +37,7 @@ def timed(name):
         yield
     finally:
         old_perf_counters[name].update(time.time() - start_time)
-
-    _PERF_COUNTERS = old_perf_counters
+        _PERF_COUNTERS = old_perf_counters
 
 
 def _show_perf_results(perf_counters, indent):
@@ -50,7 +49,7 @@ def _show_perf_results(perf_counters, indent):
             perf_counter.total_time / sum_time,
             perf_counter.total_accesses / perf_counter.total_time
         ))
-        _show_perf_results(perf_counter.subcounters, indent=4)
+        _show_perf_results(perf_counter.subcounters, indent=indent + 4)
 
 
 def show_perf_results():

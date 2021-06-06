@@ -9,7 +9,7 @@ import numpy as np
 from typing import Dict, List
 
 from parsytongue.model.model import Model, ModelConfig, DecoderConfig, EmbedderConfig, EncoderConfig, VectorizerConfig
-from parsytongue.model.perf_counter import timed
+from parsytongue.model.perf_counter import timed, show_perf_results, clear_perf_counters
 
 from parsytongue.parser.lemmatize_helper import LemmatizeHelper
 from parsytongue.parser.vocabulary import Vocabulary
@@ -90,16 +90,54 @@ def _load_weights(path):
     return renamed_weights
 
 
+class UncontextualizedVectorizer(object):
+    def __init__(self):
+        from parsytongue.model.vectorizers import ELMoVectorizer, MorphoVectorizer
+
+        self._elmo_vectorizer = ELMoVectorizer()
+        self._elmo_embedder = torch.jit.load('small_embedder.pth')
+        self._morpho_vectorizer = MorphoVectorizer()
+
+        self._output_dim = 2048 + 63
+
+        self._embeddings_cache = {}
+
+    def __call__(self, tokens):
+        token_embeddings = torch.zeros((1, len(tokens), self._output_dim))
+
+        unknown_tokens, unknown_token_indices = [], []
+        for token_index, token in enumerate(tokens):
+            token_embedding = self._embeddings_cache.get(token)
+            if token_embedding is not None:
+                token_embeddings[0, token_index] = token_embedding
+            else:
+                unknown_tokens.append(token)
+                unknown_token_indices.append(token_index)
+
+        if unknown_tokens:
+            elmo_input = self._elmo_vectorizer(unknown_tokens)
+            elmo_input = elmo_input.unsqueeze(0)
+            elmo_embeddings = self._elmo_embedder(elmo_input)
+
+            morpho_embeddings = self._morpho_vectorizer(unknown_tokens).unsqueeze(0)
+
+            unknown_token_embeddings = torch.cat((elmo_embeddings, morpho_embeddings), -1)
+
+            token_embeddings[0, unknown_token_indices] = unknown_token_embeddings
+
+            for unknown_token, unknown_token_embedding in zip(unknown_tokens, unknown_token_embeddings[0]):
+                self._embeddings_cache[unknown_token] = unknown_token_embedding
+
+        return token_embeddings
+
+
 class Parser(object):
     def __init__(self, config: ParserConfig):
         self._vocab = Vocabulary.from_files(config.vocab.vocab_path)
         self._lemmatize_helper = LemmatizeHelper.load(config.vocab.lemmatizer_path)
 
-        self._vectorizer, self._model = Model.from_config(self._vocab, config.model)
-        logger.info('Loaded model:\n%s', self._model)
-
-        self._model.load_state_dict(_load_weights(config.model.weights_path))
-        self._model.eval()
+        self._vectorizer = UncontextualizedVectorizer()
+        self._model = torch.jit.load('small_model.pth')
 
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self._model.to(device)
@@ -108,39 +146,78 @@ class Parser(object):
         self,
         sentence: List[str],
         predict_morphology: bool = True,
-        predict_lemmas: bool = False,
+        predict_lemmas: bool = True,
         predict_syntax: bool = True,
     ):
-        with timed('Run model'):
+        with timed('Full parse'):
             with torch.no_grad():
-                inputs = self._vectorizer(sentence)
-                bert_inputs = inputs['bert']
-                bert_inputs = {key: val.unsqueeze(0).to(self._model.device) for key, val in bert_inputs.items()}
-                predictions = self._model(bert_inputs, predict_morphology, predict_lemmas, predict_syntax)
+                embeddings = self._vectorizer(sentence)
+                mask = torch.ones(embeddings.shape[:-1])
+                gram_vals, lemmas, batch_energy = self._model(
+                    embeddings, mask, predict_morphology, predict_lemmas, predict_syntax
+                )
 
-        with timed('Decode predictions'):
+                predictions = {}
+
+                if gram_vals is not None:
+                    predictions['gram_vals'] = gram_vals[0].cpu().numpy()
+
+                if lemmas is not None:
+                    predictions['lemmas'] = lemmas[0].cpu().numpy()
+
+                if batch_energy is not None:
+                    heads, head_tags = self._run_mst_decoding(batch_energy)
+                    predictions['heads'] = heads
+                    predictions['head_tags'] = head_tags
+
             return self._decode(sentence, predictions)
+
+    def _run_mst_decoding(self, batch_energy):
+        scores, tag_ids = batch_energy[0].max(dim=0)
+
+        from dependency_decoding import chu_liu_edmonds
+
+        scores = scores.numpy().astype('float64')
+        instance_heads, _ = chu_liu_edmonds(scores.T)
+
+        # Find the labels which correspond to the edges in the max spanning tree.
+        instance_head_tags = []
+        for child, parent in enumerate(instance_heads):
+            instance_head_tags.append(tag_ids[parent, child].item())
+        # We don't care what the head or tag is for the root token, but by default it's
+        # not necessarily the same in the batched vs unbatched case, which is annoying.
+        # Here we'll just set them to zero.
+        instance_heads[0] = 0
+        instance_head_tags[0] = 0
+
+        return instance_heads, instance_head_tags
 
     def _decode(self, sentence: List[str], predictions: Dict[str, torch.Tensor]):
         outputs = {}
         if 'gram_vals' in predictions:
             outputs['grammar_values'] = [
                 self._vocab.get_token_from_index(grammar_value_index, 'grammar_value_tags')
-                for grammar_value_index in predictions['gram_vals'][0].cpu().numpy()
+                for grammar_value_index in predictions['gram_vals']
             ]
 
         if 'lemmas' in predictions:
             outputs['lemmas'] = [
                 self._lemmatize_helper.lemmatize(token, lemmatize_rule_index)
-                for token, lemmatize_rule_index in zip(sentence, predictions['lemmas'][0].cpu().numpy())
+                for token, lemmatize_rule_index in zip(sentence, predictions['lemmas'])
             ]
 
         if 'head_tags' in predictions:
             outputs['head_tags'] = [
                 self._vocab.get_token_from_index(grammar_value_index, 'head_tags')
-                for grammar_value_index in predictions['head_tags'][0, 1:].cpu().numpy()
+                for grammar_value_index in predictions['head_tags'][1:]
             ]
 
-            outputs['heads'] = predictions['heads'][0, 1:].cpu().numpy()
+            outputs['heads'] = predictions['heads'][1:]
 
         return outputs
+
+    def show_perf_results(self):
+        show_perf_results()
+
+    def clear_perf_counters(self):
+        clear_perf_counters()

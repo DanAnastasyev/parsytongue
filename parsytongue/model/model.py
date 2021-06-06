@@ -233,14 +233,22 @@ class Model(nn.Module, DeviceGetterMixin):
         head_tags = []
         for energy, length in zip(batch_energy.detach().cpu(), lengths):
             scores, tag_ids = energy.max(dim=0)
+
+            scores1 = scores.numpy()
             # Although we need to include the root node so that the MST includes it,
             # we do not want any word to be the parent of the root node.
             # Here, we enforce this by setting the scores for all word -> ROOT edges
             # edges to be 0.
-            scores[0, :] = 0
+            scores1[0, :] = 0
             # Decode the heads. Because we modify the scores to prevent
             # adding in word -> ROOT edges, we need to find the labels ourselves.
-            instance_heads, _ = decode_mst(scores.numpy(), length, has_labels=False)
+            instance_heads, _ = decode_mst(scores1, length, has_labels=False)
+
+            # from dependency_decoding import chu_liu_edmonds
+            # scores2 = scores.numpy()[:length, :length].astype('float64')
+            # scores2 = scores2.T
+
+            # instance_heads, _ = chu_liu_edmonds(scores2)
 
             # Find the labels which correspond to the edges in the max spanning tree.
             instance_head_tags = []
@@ -259,7 +267,7 @@ class Model(nn.Module, DeviceGetterMixin):
     @classmethod
     def from_config(cls, vocab, config):
         vectorizer = VectorizerStack.from_config(vocab, config.vectorizers)
-        embedder = EmbedderStack.from_config(config.embedders)
-        encoder = PassThroughEncoder(embedder.get_output_size(), config.encoder.params)
+        embedder = CachableUncontextualizedEmbedderStack.from_config(vectorizer, config.embedders)
+        encoder = LstmEncoder(embedder.get_output_size(), config.encoder.params)
 
-        return vectorizer, cls(embedder, encoder, config.decoder)
+        return cls(embedder, encoder, config.decoder)

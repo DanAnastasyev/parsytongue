@@ -293,3 +293,26 @@ def _find_cycle(
             break
 
     return has_cycle, list(cycle)
+
+
+def main():
+    import time
+    scores = numpy.load('example_scores.npy')
+
+    start_time = time.time()
+    instance_heads1, _ = decode_mst(scores, len(scores), has_labels=False)
+    print(time.time() - start_time)
+
+    scores = scores.astype(numpy.float64)
+
+    from dependency_decoding import chu_liu_edmonds
+    start_time = time.time()
+    # scores[1:, 0] += -6. * len(scores)
+    scores[1:, 1:] = scores[1:, 1:].T
+    instance_heads2, _ = chu_liu_edmonds(scores)
+    print(time.time() - start_time)
+    print(all(x == y for x, y in zip(instance_heads1, instance_heads2)))
+
+
+if __name__ == "__main__":
+    main()
