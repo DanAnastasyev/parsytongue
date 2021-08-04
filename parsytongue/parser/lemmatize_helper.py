@@ -4,10 +4,9 @@ import attr
 import json
 import logging
 import numbers
-import os
 
+from functools import lru_cache
 from os.path import commonprefix
-from collections import Counter, defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -25,45 +24,10 @@ class LemmatizeRule(object):
 class LemmatizeHelper(object):
     UNKNOWN_RULE_INDEX = 0
     _UNKNOWN_RULE_PLACEHOLDER = LemmatizeRule(cut_prefix=100, cut_suffix=100, append_suffix='-' * 90)
-    _OUTPUT_FILE_NAME = 'lemmatizer_info.json'
 
     def __init__(self, lemmatize_rules=None):
         self._lemmatize_rules = lemmatize_rules
         self._index_to_rule = self._get_index_to_rule()
-
-    def fit(self, data, min_freq=3):
-        rules_counter = Counter()
-
-        for instance in data:
-            meta = instance.fields['metadata']
-            words, lemmas = meta['words'], meta['lemmas']
-            for word, lemma in zip(words, lemmas):
-                if lemma == '_' and word != '_':
-                    continue
-
-                rule = self.predict_lemmatize_rule(word, lemma)
-                rules_counter[rule] += 1
-
-                assert self.lemmatize(word, rule).replace('ё', 'е') == lemma.replace('ё', 'е')
-
-        self._lemmatize_rules = {
-            self._UNKNOWN_RULE_PLACEHOLDER: self.UNKNOWN_RULE_INDEX,
-            LemmatizeRule(): self.UNKNOWN_RULE_INDEX + 1
-        }
-        skipped_count, total_count = 0., 0
-        for rule, count in rules_counter.most_common():
-            total_count += count
-            if count < min_freq:
-                skipped_count += count
-                continue
-
-            if rule not in self._lemmatize_rules:
-                self._lemmatize_rules[rule] = len(self._lemmatize_rules)
-
-        self._index_to_rule = self._get_index_to_rule()
-
-        logger.info('Lemmatize rules count = {}, did not cover {:.2%} of words'.format(
-            len(self._lemmatize_rules), skipped_count / total_count))
 
     def _get_index_to_rule(self):
         if not self._lemmatize_rules:
@@ -77,12 +41,6 @@ class LemmatizeHelper(object):
         rule = self.predict_lemmatize_rule(word, lemma)
         return self._lemmatize_rules.get(rule, self.UNKNOWN_RULE_INDEX)
 
-    def get_rule_indices(self, instance):
-        meta = instance.fields['metadata']
-        words, lemmas = meta['words'], meta['lemmas']
-
-        return [self.get_rule_index(word, lemma) for word, lemma in zip(words, lemmas)]
-
     def get_rule(self, rule_index):
         return self._index_to_rule[rule_index]
 
@@ -90,6 +48,7 @@ class LemmatizeHelper(object):
         return len(self._lemmatize_rules)
 
     @staticmethod
+    @lru_cache(maxsize=10240)
     def predict_lemmatize_rule(word: str, lemma: str):
         def _predict_lemmatize_rule(word: str, lemma: str, **kwargs):
             if len(word) == 0:
@@ -132,14 +91,9 @@ class LemmatizeHelper(object):
 
         return lemma
 
-    def save(self, dir_path):
-        with open(os.path.join(dir_path, self._OUTPUT_FILE_NAME), 'w') as f:
-            index_to_rule = [attr.asdict(rule) for rule in self._index_to_rule]
-            json.dump(index_to_rule, f, indent=2, ensure_ascii=False)
-
     @classmethod
-    def load(cls, dir_path):
-        with open(os.path.join(dir_path, cls._OUTPUT_FILE_NAME)) as f:
+    def load(cls, path):
+        with open(path) as f:
             index_to_rule = json.load(f)
 
         lemmatize_rules = {

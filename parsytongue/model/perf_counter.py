@@ -32,11 +32,11 @@ def timed(name):
     old_perf_counters = _PERF_COUNTERS
     _PERF_COUNTERS = old_perf_counters[name].subcounters
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     try:
         yield
     finally:
-        old_perf_counters[name].update(time.time() - start_time)
+        old_perf_counters[name].update(time.perf_counter() - start_time)
         _PERF_COUNTERS = old_perf_counters
 
 

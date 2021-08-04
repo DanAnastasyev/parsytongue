@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 
-import attr
+import json
 import logging
 import numpy as np
-import pymorphy2
 import torch
 
+from pymorphy2.units.by_analogy import KnownSuffixAnalyzer
+from pymorphy2.units.unkn import UnknAnalyzer
 from typing import Dict, List
+
+from parsytongue.model.embedders import EmbedderFactory
+from parsytongue.model.utils import BaseFactory, DeviceGetterMixin
+from parsytongue.parser.sentence import Sentence, Token
+from parsytongue.parser.lemmatize_helper import LemmatizeHelper
 
 logger = logging.getLogger(__name__)
 
@@ -14,53 +20,95 @@ logger = logging.getLogger(__name__)
 _MAX_WORD_LEN = 50
 
 
-@attr.s
-class VectorizerConfig(object):
-    name = attr.ib()
-    vector_key = attr.ib()
-    params = attr.ib(default=None)
+class VectorizerFactory(BaseFactory):
+    registry = {}
 
 
 class Vectorizer(object):
-    def __call__(self, tokens: List[str]):
+    def __init__(self):
+        self._device = torch.device('cpu')
+
+    def to(self, device):
+        self._device = device
+
+    def process_instance(self, tokens: List[Token]) -> Dict[str, torch.Tensor]:
         raise NotImplementedError
 
+    def get_padding_id(self, output_key: str = None):
+        return 0
 
+    def __call__(self, sentences: List[Sentence]) -> Dict[str, torch.Tensor]:
+        vectorized_batch = []
+        for sentence in sentences:
+            vectorized_batch.append(self.process_instance(sentence.tokens))
+
+        if not vectorized_batch:
+            return vectorized_batch
+
+        result = {}
+        for key in vectorized_batch[0]:
+            padding_id = self.get_padding_id(key)
+            result[key] = self._batchify(vectorized_batch, padding_id, lambda element: element[key])
+        return result
+
+    @staticmethod
+    def _batchify(samples, padding_id, get_field):
+        first_sample = get_field(samples[0])
+        max_length = max(len(get_field(sample)) for sample in samples)
+
+        tensor = torch.full(
+            (len(samples), max_length) + first_sample.shape[1:],
+            fill_value=padding_id,
+            dtype=first_sample.dtype,
+            device=first_sample.device
+        )
+
+        for sample_id, sample in enumerate(samples):
+            data = get_field(sample)
+            tensor[sample_id, :len(data)] = data
+
+        return tensor
+
+
+@VectorizerFactory.register('chars')
 class CharacterLevelVectorizer(Vectorizer):
-    NAME = 'chars'
-
     def __init__(self, vocab, **kwargs):
+        super(CharacterLevelVectorizer, self).__init__()
+
         self._vocab = vocab
 
-    def __call__(self, tokens):
+    def process_instance(self, tokens: List[Token]) -> Dict[str, torch.Tensor]:
         max_word_len = min(max(len(token) for token in tokens), _MAX_WORD_LEN)
 
         char_ids = np.zeros((len(tokens), max_word_len), dtype=np.int64)
         for token_index, token in enumerate(tokens):
-            token = token[:max_word_len]
+            token = token.text[:max_word_len]
 
             char_ids[token_index, :len(token)] = [
                 self._vocab.get_token_index(symbol, 'token_characters') for symbol in token
             ]
 
-        return torch.from_numpy(char_ids)
+        return {
+            'chars': torch.from_numpy(char_ids).to(self._device)
+        }
 
 
+@VectorizerFactory.register('elmo')
 class ELMoVectorizer(Vectorizer):
-    NAME = 'elmo'
-
     def __init__(self, **kwargs):
+        super(ELMoVectorizer, self).__init__()
+
         self._beginning_of_word_character = 258  # <begin word>
         self._end_of_word_character = 259  # <end word>
         self._padding_character = 260  # <padding>
 
-    def __call__(self, tokens):
+    def process_instance(self, tokens: List[Token]):
         max_word_len = _MAX_WORD_LEN
 
         char_ids = np.full((len(tokens), max_word_len), self._padding_character, dtype=np.int64)
         char_ids[:, 0] = self._beginning_of_word_character
         for token_index, token in enumerate(tokens):
-            token = token.encode('utf-8', 'ignore')
+            token = token.text.encode('utf-8', 'ignore')
             token = list(token[: max_word_len - 2])
 
             char_ids[token_index, 1: len(token) + 1] = token
@@ -69,29 +117,36 @@ class ELMoVectorizer(Vectorizer):
         # +1 one for masking
         char_ids = char_ids + 1
 
-        return torch.from_numpy(char_ids)
+        return {
+            'elmo': torch.from_numpy(char_ids).to(self._device)
+        }
 
 
+@VectorizerFactory.register('bert')
 class BertVectorizer(Vectorizer):
-    NAME = 'bert'
-
     def __init__(self, tokenizer_path, **kwargs):
         from transformers import BertTokenizer
+        super(BertVectorizer, self).__init__()
 
         self._tokenizer = BertTokenizer.from_pretrained(tokenizer_path, do_lower_case=False)
 
-    def __call__(self, tokens):
+    def get_padding_id(self, output_key: str = None):
+        if output_key == 'token_ids':
+            return self._tokenizer.pad_token_id
+        return 0
+
+    def process_instance(self, tokens: List[Token]):
         offsets, token_ids = [], []
         token_ids.append(self._tokenizer.cls_token_id)
         for token in tokens:
-            subtoken_ids = self._tokenizer.convert_tokens_to_ids(self._tokenizer.tokenize(token))
+            subtoken_ids = self._tokenizer.convert_tokens_to_ids(self._tokenizer.tokenize(token.text))
             offsets.append([len(token_ids), len(token_ids) + len(subtoken_ids) - 1])
             token_ids.extend(subtoken_ids)
 
         token_ids.append(self._tokenizer.sep_token_id)
 
-        token_ids = torch.tensor(token_ids, dtype=torch.long)
-        offsets = torch.tensor(offsets, dtype=torch.long)
+        token_ids = torch.tensor(token_ids, dtype=torch.long, device=self._device)
+        offsets = torch.tensor(offsets, dtype=torch.long, device=self._device)
         mask = torch.ones_like(token_ids)
         segment_ids = torch.zeros_like(token_ids)
 
@@ -103,48 +158,23 @@ class BertVectorizer(Vectorizer):
         }
 
 
+@VectorizerFactory.register('morph')
 class MorphoVectorizer(Vectorizer):
-    NAME = 'morph'
+    def __init__(self, grammeme_to_index_path, **kwargs):
+        super(MorphoVectorizer, self).__init__()
 
-    def __init__(self, **kwargs):
-        self._morph = pymorphy2.MorphAnalyzer()
-        self._grammeme_to_index = self._build_grammeme_to_index()
+        with open(grammeme_to_index_path) as f:
+            self._grammeme_to_index = json.load(f)
         self._morpho_vector_dim = max(self._grammeme_to_index.values()) + 1
 
     @property
     def morpho_vector_dim(self):
         return self._morpho_vector_dim
 
-    def _build_grammeme_to_index(self):
-        grammar_categories = [
-            self._morph.TagClass.PARTS_OF_SPEECH,
-            self._morph.TagClass.ANIMACY,
-            self._morph.TagClass.ASPECTS,
-            self._morph.TagClass.CASES,
-            self._morph.TagClass.GENDERS,
-            self._morph.TagClass.INVOLVEMENT,
-            self._morph.TagClass.MOODS,
-            self._morph.TagClass.NUMBERS,
-            self._morph.TagClass.PERSONS,
-            self._morph.TagClass.TENSES,
-            self._morph.TagClass.TRANSITIVITY,
-            self._morph.TagClass.VOICES
-        ]
-
-        grammeme_to_index = {}
-        shift = 0
-        for category in grammar_categories:
-            # TODO: Save grammeme_to_index
-            for grammeme_index, grammeme in enumerate(sorted(category)):
-                grammeme_to_index[grammeme] = grammeme_index + shift
-            shift += len(category) + 1  # +1 to address lack of the category in a parse
-
-        return grammeme_to_index
-
-    def vectorize_word(self, word):
+    def vectorize_word(self, word: Token):
         grammar_vector = np.zeros(self._morpho_vector_dim, dtype=np.float32)
         sum_parses_score = 0.
-        for parse in self._morph.parse(word):
+        for parse in word._pymorphy_forms:
             sum_parses_score += parse.score
             for grammeme in parse.tag.grammemes:
                 grammeme_index = self._grammeme_to_index.get(grammeme)
@@ -154,37 +184,250 @@ class MorphoVectorizer(Vectorizer):
         if sum_parses_score != 0.:
             grammar_vector /= sum_parses_score
 
-        assert np.all(grammar_vector < 1. + 1e-5) and np.all(grammar_vector > 0. - 1e-5)
-
+        grammar_vector = np.clip(grammar_vector, a_min=0., a_max=1.)
         return grammar_vector
 
-    def __call__(self, tokens):
+    def process_instance(self, tokens: List[Token]):
         matrix = np.stack([self.vectorize_word(token) for token in tokens], axis=0)
 
-        return torch.from_numpy(matrix)
-
-
-class VectorizerStack(Vectorizer):
-    _REGISTERED_VECTORIZERS = [CharacterLevelVectorizer, MorphoVectorizer, ELMoVectorizer, BertVectorizer]
-
-    def __init__(self, vectorizers: Dict[str, Vectorizer]):
-        self._vectorizers = vectorizers
-
-    def __call__(self, tokens: List[str]):
         return {
-            vectorizer_key: vectorizer(tokens)
-            for vectorizer_key, vectorizer in self._vectorizers.items()
+            'morpho_embeddings': torch.from_numpy(matrix).to(self._device)
         }
 
-    @classmethod
-    def from_config(cls, vocab, configs):
-        vectorizers = {}
-        for config in configs:
-            for vectorizer_cls in cls._REGISTERED_VECTORIZERS:
-                if config.name == vectorizer_cls.NAME:
-                    params = config.params or {}
-                    vectorizers[config.vector_key] = vectorizer_cls(vocab=vocab, **params)
 
-        assert len(vectorizers) == len(configs)
+@VectorizerFactory.register('lemma')
+class LemmaVectorizer(Vectorizer):
+    def __init__(self, lemmatize_helper_path: str, output_key: str = 'lemmas'):
+        super(LemmaVectorizer, self).__init__()
 
-        return cls(vectorizers)
+        self._lemmatize_helper = LemmatizeHelper.load(lemmatize_helper_path)
+        self._output_key = output_key
+
+    @staticmethod
+    def _is_unknown(parse):
+        return any(isinstance(unit[0], (UnknAnalyzer, KnownSuffixAnalyzer.FakeDictionary))
+                for unit in parse.methods_stack)
+
+    def vectorize_word(self, word):
+        lemma_vector = np.zeros(len(self._lemmatize_helper), dtype=np.float32)
+        for parse in word._pymorphy_forms:
+            if self._is_unknown(parse):
+                continue
+            for form in parse.lexeme:
+                lemma_id = self._lemmatize_helper.get_rule_index(word.text, form.word)
+                lemma_vector[lemma_id] = 1.
+        return lemma_vector
+
+    def process_instance(self, tokens: List[Token]):
+        matrix = np.stack([self.vectorize_word(token) for token in tokens], axis=0)
+
+        return {
+            self._output_key: torch.from_numpy(matrix).to(self._device)
+        }
+
+
+@VectorizerFactory.register('mask')
+class MaskVectorizer(Vectorizer):
+    def __init__(self, **kwargs):
+        super(MaskVectorizer, self).__init__()
+
+    def process_instance(self, tokens: List[Token]):
+        return {
+            'mask': torch.ones(len(tokens), dtype=torch.long, device=self._device)
+        }
+
+
+@VectorizerFactory.register('embeddings')
+class EmbeddingsVectorizer(Vectorizer):
+    def __init__(self, **kwargs):
+        super(EmbeddingsVectorizer, self).__init__()
+
+    def process_instance(self, tokens: List[Token]):
+        return {
+            'embeddings': torch.stack([token._embedding for token in tokens], dim=0).to(self._device)
+        }
+
+
+@VectorizerFactory.register('stack')
+class VectorizerStack(Vectorizer):
+    def __init__(self, vectorizers: List[Dict], **kwargs):
+        super(VectorizerStack, self).__init__()
+
+        self._vectorizers = []
+        for params in vectorizers:
+            self._vectorizers.append(VectorizerFactory.build(**params))
+
+    def to(self, device):
+        super(VectorizerStack, self).to(device)
+
+        for vectorizer in self._vectorizers.values():
+            vectorizer.to(device)
+
+    def process_instance(self, tokens: List[Token]):
+        result = {}
+        for vectorizer in self._vectorizers:
+            result.update(vectorizer.process_instance(tokens))
+        return result
+
+
+@VectorizerFactory.register('precomputed_embeddings')
+class PrecomputedEmbeddingsVectorizer(torch.nn.Module, Vectorizer, DeviceGetterMixin):
+    def __init__(self, vectorizers, embedders) -> None:
+        super(PrecomputedEmbeddingsVectorizer, self).__init__()
+
+        self._device = torch.device('cpu')
+        self._vectorizer = VectorizerFactory.build(**vectorizers)
+        self._embedder = EmbedderFactory.build(**embedders)
+        self._output_dim = self._embedder.get_output_size()
+        self._embeddings_cache = {}
+
+    def to(self, device):
+        self._device = device
+        self._vectorizer.to(device)
+        self._embedder.to(device)
+
+    def __call__(self, sentences: List[Sentence]):
+        max_length = max(len(sentence.tokens) for sentence in sentences)
+
+        token_embeddings = torch.zeros((len(sentences), max_length, self._output_dim), device=self._device)
+        mask = torch.zeros((len(sentences), max_length), device=self._device)
+
+        unknown_tokens, unknown_token_rows, unknown_token_columns = [], [], []
+        for sent_index, sentence in enumerate(sentences):
+            mask[sent_index, :len(sentence.tokens)] = 1
+
+            for token_index, token in enumerate(sentence.tokens):
+                token_embedding = self._embeddings_cache.get(token.text)
+                if token_embedding is not None:
+                    token_embeddings[sent_index, token_index] = token_embedding.to(self._device)
+                else:
+                    unknown_tokens.append(token)
+                    unknown_token_rows.append(sent_index)
+                    unknown_token_columns.append(token_index)
+
+        if unknown_tokens:
+            vectorized_unknown_tokens = self._vectorizer.process_instance(unknown_tokens)
+            vectorized_unknown_tokens = {
+                key: value.unsqueeze(0) for key, value in vectorized_unknown_tokens.items()
+            }
+
+            unknown_token_embeddings = self._embedder(vectorized_unknown_tokens)
+            token_embeddings[unknown_token_rows, unknown_token_columns] = unknown_token_embeddings
+
+            for unknown_token, unknown_token_embedding in zip(unknown_tokens, unknown_token_embeddings[0]):
+                self._embeddings_cache[unknown_token.text] = unknown_token_embedding
+
+        return {
+            'token_embeddings': token_embeddings,
+            'mask': mask
+        }
+
+
+import os
+
+def _fix_path(config, dir_path):
+    if isinstance(config, list):
+        for element in config:
+            if isinstance(element, dict):
+                _fix_path(element, dir_path)
+        return
+
+    for key, value in config.items():
+        if key.endswith('_path') and isinstance(value, str):
+            config[key] = os.path.join(dir_path, value)
+        if isinstance(value, (dict, list)):
+            _fix_path(value, dir_path)
+
+
+def main():
+    dir_path = "models"
+
+    json_config = {
+        "name": "precomputed_embeddings",
+        "vectorizers": {
+            "name": "stack",
+            "vectorizers": [
+                {
+                    "name": "elmo",
+                    "vector_key": "elmo"
+                },
+                {
+                    "name": "morph",
+                    "vector_key": "morpho_embeddings",
+                    "grammeme_to_index_path": "grammeme_to_index.json"
+                },
+                {
+                    "name": "bert",
+                    "vector_key": "bert",
+                    "tokenizer_path": "bert_tokenizer"
+                }
+            ]
+        },
+        "embedders": {
+            "name": "stack",
+            "embedders": [
+                {
+                    "name": "uncontextualized_elmo",
+                    "params": {
+                        "input_name": "elmo",
+                        "char_count": 262,
+                        "char_embedding_dim": 16,
+                        "filters": [
+                            [
+                                1,
+                                32
+                            ],
+                            [
+                                2,
+                                32
+                            ],
+                            [
+                                3,
+                                64
+                            ],
+                            [
+                                4,
+                                128
+                            ],
+                            [
+                                5,
+                                256
+                            ],
+                            [
+                                6,
+                                512
+                            ],
+                            [
+                                7,
+                                1024
+                            ]
+                        ],
+                        "use_projections": False,
+                        "highway_count": 0,
+                        "projection_dim": -1
+                    }
+                },
+                {
+                    "name": "pass_through",
+                    "params": {
+                        "input_name": "morpho_embeddings",
+                        "dim": 63
+                    }
+                }
+            ]
+        }
+    }
+
+    _fix_path(json_config, dir_path)
+
+    print(VectorizerFactory.registry)
+
+    vectorizer = VectorizerFactory.build(**json_config)
+
+    sentences = [Sentence("мама мыла раму"), Sentence("красивая мама нежно гладила бельё")]
+
+    print(vectorizer(sentences)['token_embeddings'].shape)
+
+
+if __name__ == '__main__':
+    main()
